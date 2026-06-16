@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>弹幕捕手</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">弹幕<br />捕手</div>
+      <nav>
+        <button class="nav-item active" title="扣数打印"><span>▣</span>扣数打印</button>
+        <button class="nav-item" title="打印模板"><span>▥</span>打印模板</button>
+        <button class="nav-item" title="订单备注"><span>✎</span>订单备注</button>
+        <button class="nav-item" title="买家管理"><span>♙</span>买家管理</button>
+        <button class="nav-item" title="系统设置"><span>⚙</span>系统设置</button>
+        <button class="nav-item" title="我的账户"><span>○</span>我的账户</button>
+      </nav>
+    </aside>
+
+    <main class="shell">
+      <section class="top-grid">
+        <div class="panel setup-panel">
+          <label class="field">
+            <span>直播间</span>
+            <select id="roomSelect"></select>
+            <button id="addRoomBtn" class="link-button">去登录</button>
+          </label>
+          <label class="field">
+            <span>打印模板</span>
+            <select id="templateSelect">
+              <option>标签纸60x40</option>
+              <option>热敏纸80x50</option>
+              <option>快递标签100x100</option>
+            </select>
+            <button class="link-button">设置模板</button>
+          </label>
+          <label class="field">
+            <span>打印机</span>
+            <select id="printerSelect">
+              <option>HPRT N31D</option>
+              <option>模拟打印机</option>
+              <option>未连接</option>
+            </select>
+            <button id="testPrintBtn" class="link-button">测试打印</button>
+          </label>
+          <div class="rule-row">
+            <span>序号规则</span>
+            <label><input type="radio" name="serialRule" value="round" /> 轮次序号</label>
+            <label><input type="radio" name="serialRule" value="flow" checked /> 流水序号</label>
+            <button class="link-button">设置自动重置规则</button>
+            <button class="link-button">手动重置</button>
+          </div>
+          <button id="toggleCaptureBtn" class="primary-button">开启自动打印</button>
+        </div>
+
+        <div class="panel rules-panel">
+          <div class="tabs">
+            <button class="tab active">自定义</button>
+            <button class="tab">宫格</button>
+          </div>
+          <div class="range-line">
+            <span>数字范围</span>
+            <label><input type="radio" name="numberMode" checked /> 区间</label>
+            <input id="serialStart" type="number" value="1" />
+            <input id="serialEnd" type="number" value="999999" />
+            <label><input id="includeDecimal" type="checkbox" checked /> 包含小数</label>
+          </div>
+          <div class="range-line muted-line">
+            <span></span>
+            <label><input type="radio" name="numberMode" /> 指定</label>
+            <input class="wide-input" disabled placeholder="填写数字，多个数字用逗号隔开" />
+          </div>
+          <div class="check-grid">
+            <span>扣数格式</span>
+            <label><input id="pureNumberRule" type="checkbox" checked /> 纯数字</label>
+            <label><input type="checkbox" /> 数字+符号</label>
+            <label><input type="checkbox" /> 3位字母+1位数字</label>
+            <label><input type="checkbox" /> 包含数字</label>
+            <label><input type="checkbox" /> 4位数字</label>
+            <label><input type="checkbox" /> 数字+尺码</label>
+            <button class="link-button">设置尺码</button>
+          </div>
+          <div class="keyword-row">
+            <label><input id="keywordEnabled" type="checkbox" /> 数字+关键词</label>
+            <button class="link-button">关键词匹配规则</button>
+          </div>
+          <input id="keywordInput" class="keyword-input" placeholder="填写关键词，多个关键词用逗号隔开" />
+        </div>
+
+        <div class="panel draw-panel">
+          <div class="draw-line">
+            <label>限量抢单 <input id="limitEnabled" type="checkbox" checked /></label>
+            <label>只打前 <input id="limitCount" type="number" value="100" /> 个扣数的买家</label>
+            <button class="link-button">孤品模式</button>
+          </div>
+          <div class="draw-line">
+            <label>快速过款 <input id="fastPassEnabled" type="checkbox" /></label>
+            <label>开启后每过 <input id="fastPassSeconds" type="number" value="30" /> 秒，自动按原规则开始下一轮</label>
+          </div>
+          <div class="draw-line">
+            <label>防空打 <input id="dedupeEnabled" type="checkbox" checked /></label>
+            <label>同一个买家 <input id="dedupeSeconds" type="number" value="5" /> 秒内重复扣数不打单</label>
+          </div>
+          <div class="draw-line">
+            <label>灯牌优先 <input id="lampPriority" type="checkbox" /></label>
+            <label>非灯牌延时打印 <input type="number" value="30" /> 秒</label>
+            <label><input id="emptyPrintEnabled" type="checkbox" /> 只打团灯牌</label>
+          </div>
+          <div class="stat-strip">
+            <div><strong id="localCount">0</strong><span>扣中</span></div>
+            <div><strong id="limitStat">100</strong><span>限量</span></div>
+            <button id="drawBtn" class="ghost-button">下一轮</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="list-section">
+        <div class="list-header">
+          <div>
+            <strong>弹幕列表</strong>
+            <span>数据保存72小时</span>
+            <button class="link-button">列表显示</button>
+          </div>
+          <div class="reminder">
+            <span>弹单提醒</span>
+            <button class="link-button">设置</button>
+            <label class="switch"><input type="checkbox" /><span></span></label>
+          </div>
+        </div>
+        <div class="filters">
+          <div class="segmented">
+            <button data-status="all" class="active">全部</button>
+            <button data-status="matched">已扣中</button>
+            <button data-status="pending">未扣中</button>
+          </div>
+          <label>直播间：<select id="filterRoom"><option value="all">全部直播间</option></select></label>
+          <label>时间：<select><option>全部</option><option>近10分钟</option><option>今天</option></select></label>
+          <label>昵称：<input id="searchInput" placeholder="搜索昵称" /></label>
+          <button id="searchBtn" class="small-primary">查询</button>
+          <button id="resetBtn" class="small-button">重置</button>
+          <button id="exportBtn" class="small-button">导出</button>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>序号</th>
+              <th>直播间</th>
+              <th>昵称</th>
+              <th>公开内容</th>
+              <th>已匹配内容</th>
+              <th>批次号</th>
+              <th>公开时间</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="danmuBody"></tbody>
+        </table>
+        <div id="emptyState" class="empty-state">
+          <div class="empty-icon">▱</div>
+          <span>暂无数据</span>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="roomDialog">
+      <form method="dialog" class="modal">
+        <h3>绑定直播工作台</h3>
+        <p id="roomDialogCopy" class="modal-copy">点击下面的按钮后会直接打开抖店直播中控台。如果当前还没登录，抖店会先显示登录页；登录完成后通常会自动回到直播中控台。</p>
+        <div id="roomAuthState" class="auth-state idle">
+          <div class="auth-dot"></div>
+          <div>
+            <strong id="roomAuthTitle">等待登录</strong>
+            <p id="roomAuthHint">进入直播中控台后，这里会在几秒内自动尝试连接并开始抓取弹幕。</p>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="openStudioLoginBtn" type="button" class="small-button">打开直播中控台</button>
+          <button id="cancelRoomBtn" value="cancel" class="small-button">取消</button>
+          <button id="saveRoomBtn" value="default" class="small-primary" disabled>自动等待登录完成</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
