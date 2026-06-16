@@ -6,9 +6,7 @@ const state = {
   statusFilter: "all",
   integrations: {},
   authSessionId: "",
-  authPopup: null,
   authPollTimer: null,
-  authStartedAt: 0,
   authConnecting: false,
 };
 
@@ -127,7 +125,9 @@ function applySettings(settings) {
 }
 
 function renderRooms() {
-  const boundRooms = state.rooms.filter((room) => room.captureStatus === "已绑定" || room.sourceType !== "studio");
+  const boundRooms = state.rooms.filter(
+    (room) => ["已绑定", "bound"].includes(room.captureStatus) || room.sourceType !== "studio",
+  );
   const options = boundRooms
     .map((room) => {
       const sourceLabel = room.sourceType === "studio" ? "中控台" : "网页";
@@ -171,11 +171,11 @@ function renderDanmu(rows = state.danmu) {
 async function loadState() {
   const payload = await api("/api/state");
   state.rooms = uniqueRooms(payload.rooms || []);
-  state.danmu = payload.danmu;
-  state.winners = payload.winners;
+  state.danmu = payload.danmu || [];
+  state.winners = payload.winners || [];
   state.integrations = payload.integrations || {};
   renderRooms();
-  applySettings(payload.settings);
+  applySettings(payload.settings || {});
   renderDanmu();
 }
 
@@ -190,102 +190,70 @@ async function queryDanmu() {
 }
 
 async function loadStudioBindingInfo() {
-  const payload = await api("/api/integrations/douyin-studio");
-  setAuthVisual("idle", "等待登录", "进入直播中控台后，这里会在几秒内自动尝试连接直播中控台。");
+  await api("/api/integrations/douyin-studio");
+  setAuthVisual("idle", "等待登录", "点击后会由后端打开独立 Firefox。登录完成后，这里会自动识别店铺并开始抓取。");
   $("#saveRoomBtn").disabled = true;
   $("#saveRoomBtn").textContent = "自动等待登录完成";
-  return payload;
 }
 
-async function finishStudioLogin() {
+function clearAuthPolling() {
+  if (state.authPollTimer) {
+    window.clearInterval(state.authPollTimer);
+    state.authPollTimer = null;
+  }
+}
+
+function resetRoomDialog() {
+  clearAuthPolling();
+  state.authSessionId = "";
+  state.authConnecting = false;
+  $("#saveRoomBtn").disabled = true;
+  $("#saveRoomBtn").textContent = "自动等待登录完成";
+  setAuthVisual("idle", "等待登录", "点击后会由后端打开独立 Firefox。登录完成后，这里会自动识别店铺并开始抓取。");
+}
+
+async function pollAuthSession() {
   if (!state.authSessionId || state.authConnecting) {
     return;
   }
   state.authConnecting = true;
-  setAuthVisual("waiting", "正在连接中控台", "正在同步登录状态并准备开始抓取弹幕。");
   try {
-    const result = await api("/api/integrations/douyin-studio/auth/complete", {
-      method: "POST",
-      body: JSON.stringify({
-        sessionId: state.authSessionId,
-      }),
-    });
-    upsertRoom(result.room);
-    state.settings = result.settings;
-    renderRooms();
-    applySettings(result.settings);
-    $("#saveRoomBtn").disabled = false;
-    $("#saveRoomBtn").textContent = "连接成功";
-    setAuthVisual("success", "连接成功", "已进入直播中控台，弹幕抓取已自动开始。");
-    if (state.authPopup && !state.authPopup.closed) {
-      try {
-        state.authPopup.close();
-      } catch (error) {
-        console.debug("popup close skipped", error);
-      }
+    const session = await api(`/api/integrations/douyin-studio/auth/${state.authSessionId}`);
+    if (session.status === "connected") {
+      $("#saveRoomBtn").disabled = false;
+      $("#saveRoomBtn").textContent = "连接成功";
+      setAuthVisual("success", "连接成功", "已识别登录态，窗口已自动关闭，真实弹幕抓取已开始。");
+      clearAuthPolling();
+      await loadState();
+      toast(`已连接 ${session.name || "直播间"}`);
+      window.setTimeout(() => {
+        $("#roomDialog").close();
+        resetRoomDialog();
+      }, 800);
+      return;
     }
-    toast("直播中控台已连接，开始抓取弹幕");
-    window.setTimeout(() => {
-      $("#roomDialog").close();
-      resetRoomDialog();
-    }, 900);
+    setAuthVisual("waiting", "等待登录完成", "请在 Firefox 中完成抖店登录并进入直播中控台，系统会自动继续。");
+  } catch (error) {
+    setAuthVisual("waiting", "等待登录完成", error.message || "正在等待登录态稳定。");
   } finally {
     state.authConnecting = false;
   }
 }
 
-function resetRoomDialog() {
+async function startStudioAuth() {
+  const session = await api("/api/integrations/douyin-studio/auth/start", {
+    method: "POST",
+    body: "{}",
+  });
+  state.authSessionId = session.id;
   $("#saveRoomBtn").disabled = true;
-  $("#saveRoomBtn").textContent = "自动等待登录完成";
-  setAuthVisual("idle", "等待登录", "进入直播中控台后，这里会在几秒内自动尝试连接直播中控台。");
-  state.authSessionId = "";
-  state.authPopup = null;
-  state.authStartedAt = 0;
-  state.authConnecting = false;
-  if (state.authPollTimer) {
-    window.clearInterval(state.authPollTimer);
-    state.authPollTimer = null;
-  }
-}
-
-function watchAuthPopup() {
-  if (state.authPollTimer) {
-    window.clearInterval(state.authPollTimer);
-  }
-  state.authPollTimer = window.setInterval(async () => {
-    const elapsed = Date.now() - state.authStartedAt;
-    const popupStillOpen = state.authPopup && !state.authPopup.closed;
-    const shouldAutoContinue = popupStillOpen && elapsed >= 3500;
-    const shouldContinueAfterClose = !popupStillOpen;
-
-    if (!shouldAutoContinue && !shouldContinueAfterClose) {
-      return;
-    }
-
-    window.clearInterval(state.authPollTimer);
-    state.authPollTimer = null;
-    try {
-      await finishStudioLogin();
-    } catch (error) {
-      setAuthVisual("idle", "连接失败", error.message || "登录已结束，但连接直播中控台失败。");
-      toast(error.message || "连接直播中控台失败");
-    }
-  }, 1200);
-}
-
-async function tryAutoConnectOnFocus() {
-  if (!state.authSessionId || state.authConnecting) {
-    return;
-  }
-  const elapsed = Date.now() - state.authStartedAt;
-  if (elapsed < 2000) {
-    return;
-  }
-  try {
-    await finishStudioLogin();
-  } catch (error) {
-    setAuthVisual("waiting", "等待登录完成", "已回到主窗口，继续等待中控台登录稳定后自动连接。");
-  }
+  $("#saveRoomBtn").textContent = "等待自动连接";
+  setAuthVisual("waiting", "已打开登录窗口", "请在新打开的 Firefox 窗口里完成登录，完成后这里会自动连接并关闭窗口。");
+  clearAuthPolling();
+  state.authPollTimer = window.setInterval(() => {
+    pollAuthSession().catch((error) => console.debug("auth polling skipped", error));
+  }, 1500);
+  pollAuthSession().catch((error) => console.debug("auth polling skipped", error));
 }
 
 function setupEvents() {
@@ -293,32 +261,21 @@ function setupEvents() {
     await loadStudioBindingInfo();
     $("#roomDialog").showModal();
   });
-  $("#openStudioLoginBtn").addEventListener("click", async () => {
-    const session = await api("/api/integrations/douyin-studio/auth/start", {
-      method: "POST",
-      body: "{}",
+
+  $("#openStudioLoginBtn").addEventListener("click", () => {
+    startStudioAuth().catch((error) => {
+      toast(error.message);
+      setAuthVisual("idle", "打开失败", error.message);
     });
-    state.authSessionId = session.id;
-    const url = session.authUrl || "";
-    if (!url) {
-      toast("登录地址还没准备好");
-      return;
-    }
-    state.authPopup = window.open(url, "_blank", "width=1180,height=820");
-    state.authStartedAt = Date.now();
-    if (!state.authPopup) {
-      setAuthVisual("waiting", "已打开中控台", "浏览器未返回窗口句柄。进入直播中控台后，这里会自动继续连接。");
-      toast("已打开中控台，登录完成后会自动连接");
-    } else {
-      setAuthVisual("waiting", "等待登录完成", "请在新窗口完成抖店登录或进入直播中控台，这里会在几秒后自动继续连接。");
-      watchAuthPopup();
-    }
-    $("#saveRoomBtn").disabled = true;
   });
+
   $("#saveRoomBtn").addEventListener("click", async (event) => {
     event.preventDefault();
   });
-  $("#cancelRoomBtn").addEventListener("click", () => resetRoomDialog());
+
+  $("#cancelRoomBtn").addEventListener("click", () => {
+    resetRoomDialog();
+  });
 
   $("#toggleCaptureBtn").addEventListener("click", async () => {
     await persistSettings();
@@ -364,6 +321,7 @@ function setupEvents() {
     $$(".segmented button").forEach((item) => item.classList.toggle("active", item.dataset.status === "all"));
     renderDanmu();
   });
+
   $("#exportBtn").addEventListener("click", () => {
     const blob = new Blob([JSON.stringify(state.danmu, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -414,6 +372,15 @@ function connectEvents() {
     upsertRoom(room);
     renderRooms();
   });
+  source.addEventListener("auth", (event) => {
+    const session = JSON.parse(event.data);
+    if (session.id !== state.authSessionId) {
+      return;
+    }
+    if (session.status === "connected") {
+      pollAuthSession().catch((error) => console.debug("auth event sync skipped", error));
+    }
+  });
   source.onerror = () => {
     toast("实时连接重试中");
   };
@@ -422,9 +389,6 @@ function connectEvents() {
 window.addEventListener("DOMContentLoaded", async () => {
   setupEvents();
   resetRoomDialog();
-  window.addEventListener("focus", () => {
-    tryAutoConnectOnFocus().catch((error) => console.debug("focus auto connect skipped", error));
-  });
   try {
     await loadState();
     connectEvents();

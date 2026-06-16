@@ -8,12 +8,14 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html import unescape
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -28,7 +30,26 @@ STATE_FILE = DATA_DIR / "state.json"
 PRINT_LOG_FILE = DATA_DIR / "print-jobs.jsonl"
 FIREFOX_PROFILE_DIR = DATA_DIR / "managed-firefox-profile"
 TEMP_DIR = DATA_DIR / "tmp"
+REMOTE_INSPECT_DIR = ROOT / ".remote-inspect"
 TZ = timezone(timedelta(hours=8))
+
+if REMOTE_INSPECT_DIR.exists():
+    sys.path.insert(0, str(REMOTE_INSPECT_DIR))
+
+try:
+    import danmu_cli as douyin_fetcher_module
+    from danmu_cli import ChatMessage, DanmuFetcher
+
+    _original_generate_signature = douyin_fetcher_module.generate_signature
+
+    def _generate_signature_with_project_assets(wss: str, script_file: str = "sign.js") -> str:
+        return _original_generate_signature(wss, str(REMOTE_INSPECT_DIR / "sign.js"))
+
+    douyin_fetcher_module.generate_signature = _generate_signature_with_project_assets
+except Exception:
+    ChatMessage = None
+    DanmuFetcher = None
+    douyin_fetcher_module = None
 
 
 def now_iso() -> str:
@@ -84,6 +105,7 @@ class AppState:
     )
     subscribers: list[queue.Queue] = field(default_factory=list)
     auth_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    capture_workers: dict[str, Any] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -288,26 +310,54 @@ def fetch_with_cookies(url: str, cookies: dict[str, str]) -> str:
 
 
 def parse_shop_name(page_text: str) -> str:
+    title_match = re.search(r"<title>(.*?)</title>", page_text, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        raw_title = unescape(title_match.group(1)).strip()
+        cleaned_title = re.sub(r"\s*[-|_].*$", "", raw_title).strip()
+        if cleaned_title and cleaned_title not in {"抖店", "直播中控台", "首页"}:
+            return cleaned_title
+
     patterns = [
         r'"shopName"\s*:\s*"([^"]+)"',
         r'"storeName"\s*:\s*"([^"]+)"',
         r'"merchantName"\s*:\s*"([^"]+)"',
         r'"userName"\s*:\s*"([^"]+)"',
+        r'"shop_name"\s*:\s*"([^"]+)"',
+        r'"mall_name"\s*:\s*"([^"]+)"',
     ]
     for pattern in patterns:
         match = re.search(pattern, page_text)
         if match:
-            name = match.group(1).strip()
+            name = decode_js_text(match.group(1)).strip()
             if name:
                 return name
     return ""
 
 
-def parse_live_comments(page_text: str) -> list[dict[str, str]]:
-    results: list[dict[str, str]] = []
-    for user_name, content in re.findall(r'"nickname"\s*:\s*"([^"]{1,40})".{0,200}?"content"\s*:\s*"([^"]{1,120})"', page_text):
-        results.append({"userName": user_name.strip(), "content": content.strip()})
-    return results
+def decode_js_text(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except Exception:
+        return unescape(value)
+
+
+def parse_live_ids(*page_texts: str) -> list[str]:
+    candidates: list[str] = []
+    patterns = [
+        r"https://live\.douyin\.com/(\d{6,24})",
+        r'"webRid"\s*:\s*"(\d{6,24})"',
+        r'"web_rid"\s*:\s*"(\d{6,24})"',
+        r'"roomIdStr"\s*:\s*"(\d{6,24})"',
+        r'"promoteId"\s*:\s*"(\d{6,24})"',
+    ]
+    for page_text in page_texts:
+        if not page_text:
+            continue
+        for pattern in patterns:
+            for live_id in re.findall(pattern, page_text):
+                if live_id not in candidates:
+                    candidates.append(live_id)
+    return candidates
 
 
 def append_real_danmu(room: dict[str, Any], comments: list[dict[str, str]]) -> None:
@@ -346,6 +396,92 @@ def close_managed_firefox(pid: int | None) -> None:
         subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False, capture_output=True)
     except Exception:
         pass
+
+
+def stop_capture_worker(room_id: str) -> None:
+    with STATE.lock:
+        worker = STATE.capture_workers.pop(room_id, None)
+    if worker:
+        worker.stop()
+
+
+class RealDanmuWorker:
+    def __init__(self, room: dict[str, Any], live_id: str):
+        self.room_id = room["id"]
+        self.room_name = room["name"]
+        self.live_id = live_id
+        self.stop_event = threading.Event()
+        self.fetcher: Any = None
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.fetcher:
+            try:
+                self.fetcher.stop()
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        if not DanmuFetcher or not ChatMessage:
+            return
+        try:
+            self.fetcher = DanmuFetcher(self.live_id, abogus_file=str(REMOTE_INSPECT_DIR / "a_bogus.js"))
+            self.fetcher.start(self.on_message)
+        except Exception:
+            pass
+
+    def on_message(self, message_obj: Any, _server_now_ms: int) -> None:
+        if self.stop_event.is_set() or not isinstance(message_obj, ChatMessage):
+            return
+        content = (message_obj.content or "").strip()
+        user_name = (message_obj.user.nick_name or "").strip()
+        if not content or not user_name:
+            return
+        matched_content = extract_match(content, STATE.settings)
+        item = {
+            "id": next_id("dm"),
+            "event": "chat",
+            "roomId": self.room_id,
+            "roomName": self.room_name,
+            "userName": user_name,
+            "userId": str(message_obj.user.id or ""),
+            "content": content,
+            "matchedContent": matched_content,
+            "batchNo": "",
+            "status": "matched" if matched_content else "pending",
+            "publicTime": now_iso(),
+            "createdAt": now_iso(),
+        }
+        with STATE.lock:
+            duplicate = any(
+                existing.get("roomId") == item["roomId"]
+                and existing.get("userName") == item["userName"]
+                and existing.get("content") == item["content"]
+                for existing in STATE.danmu[:100]
+            )
+            if duplicate:
+                return
+            STATE.danmu.insert(0, item)
+            STATE.danmu = STATE.danmu[:500]
+        publish("danmu", item)
+
+
+def start_real_danmu_capture(room: dict[str, Any], live_id: str) -> None:
+    if not live_id or not DanmuFetcher:
+        return
+    with STATE.lock:
+        existing = STATE.capture_workers.get(room["id"])
+        if existing and getattr(existing, "live_id", "") == live_id:
+            return
+    stop_capture_worker(room["id"])
+    worker = RealDanmuWorker(room, live_id)
+    with STATE.lock:
+        STATE.capture_workers[room["id"]] = worker
+    worker.start()
 
 
 def extract_match(content: str, settings: dict[str, Any]) -> str:
@@ -436,12 +572,13 @@ def add_room(payload: dict[str, Any]) -> dict[str, Any]:
     name = (payload.get("name") or "").strip()
     source_type = (payload.get("sourceType") or "studio").strip() or "studio"
     url = normalize_room_url(payload.get("url") or "")
+    control_url = ""
     if source_type == "studio":
         control_url = (payload.get("controlUrl") or "").strip()
         if not payload.get("bindingConfirmed"):
-            raise ValueError("请先登录并进入直播中控台，再完成绑定")
+            raise ValueError("Please finish login in the control center before binding.")
         if not is_valid_studio_control_url(control_url):
-            raise ValueError("请填写有效的抖店直播中控台链接")
+            raise ValueError("Invalid studio control center URL.")
         url = control_url
         with STATE.lock:
             existing = next(
@@ -453,22 +590,34 @@ def add_room(payload: dict[str, Any]) -> dict[str, Any]:
                 None,
             )
         if existing:
-            if name and existing.get("name") == "待识别直播间":
+            room_changed = False
+            if name and existing.get("name") in {"Pending Studio", "Pending Studio (Control Center)"}:
                 with STATE.lock:
                     existing["name"] = name
+                room_changed = True
+            live_id = (payload.get("liveId") or "").strip()
+            if live_id and existing.get("liveId") != live_id:
+                with STATE.lock:
+                    existing["liveId"] = live_id
+                room_changed = True
+            if room_changed:
                 save_state()
                 publish("room", existing)
             return existing
     elif not url:
-        raise ValueError("直播间地址不能为空")
+        raise ValueError("Room URL is required.")
+
+    with STATE.lock:
+        room_index = len(STATE.rooms) + 1
     room = {
         "id": next_id("room"),
-        "name": name or ("待识别直播间" if source_type == "studio" else f"直播间{len(STATE.rooms) + 1}"),
+        "name": name or ("Pending Studio" if source_type == "studio" else f"Room {room_index}"),
         "url": url,
         "sourceType": source_type,
         "loginUrl": get_studio_auth_url() if source_type == "studio" else "",
         "controlUrl": control_url if source_type == "studio" else "",
-        "captureStatus": "已绑定",
+        "liveId": (payload.get("liveId") or "").strip(),
+        "captureStatus": "bound",
         "boundAt": now_iso(),
         "enabled": True,
         "createdAt": now_iso(),
@@ -481,12 +630,19 @@ def add_room(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def start_studio_auth(payload: dict[str, Any]) -> dict[str, Any]:
+    with STATE.lock:
+        stale_sessions = list(STATE.auth_sessions.values())
+        STATE.auth_sessions.clear()
+    for stale_session in stale_sessions:
+        close_managed_firefox(stale_session.get("pid"))
+
     session_id = next_id("auth")
     launch_info = launch_managed_firefox(session_id)
     session = {
         "id": session_id,
-        "name": "待识别直播间",
+        "name": "Pending Studio",
         "status": "waiting_login",
+        "detail": "waiting_login",
         "authUrl": get_studio_auth_url(),
         "controlCenterUrl": control_center_url(),
         "profileDir": launch_info["profileDir"],
@@ -513,20 +669,24 @@ def complete_studio_auth(payload: dict[str, Any]) -> dict[str, Any]:
     session = get_studio_auth_session(session_id)
     room = add_room(
         {
-            "name": session.get("name") or "待识别直播间",
+            "name": session.get("name") or "Pending Studio",
             "sourceType": "studio",
             "controlUrl": control_center_url(),
+            "liveId": session.get("liveId") or "",
             "bindingConfirmed": True,
         }
     )
     with STATE.lock:
         session["status"] = "connected"
+        session["detail"] = "connected"
         session["roomId"] = room["id"]
         session["connectedAt"] = now_iso()
         STATE.settings["running"] = True
         settings = dict(STATE.settings)
     save_state()
     close_managed_firefox(session.get("pid"))
+    if session.get("liveId"):
+        start_real_danmu_capture(room, session["liveId"])
     publish("auth", session)
     publish("settings", settings)
     return {"session": session, "room": room, "settings": settings}
@@ -550,13 +710,15 @@ def refresh_auth_sessions() -> None:
             except Exception:
                 continue
 
-            shop_name = parse_shop_name(homepage_text) or parse_shop_name(control_text) or "待识别直播间"
+            shop_name = parse_shop_name(homepage_text) or parse_shop_name(control_text) or "Pending Studio"
+            live_ids = parse_live_ids(homepage_text, control_text)
             with STATE.lock:
                 if session.get("status") != "waiting_login":
                     continue
                 session["name"] = shop_name
-            result = complete_studio_auth({"sessionId": session["id"]})
-            append_real_danmu(result["room"], parse_live_comments(control_text))
+                session["liveId"] = live_ids[0] if live_ids else ""
+                session["detail"] = "cookies_detected"
+            complete_studio_auth({"sessionId": session["id"]})
 
 
 def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
@@ -784,6 +946,7 @@ def main() -> None:
 
     load_state()
     threading.Thread(target=collector_loop, daemon=True).start()
+    threading.Thread(target=refresh_auth_sessions, daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), RequestHandler)
     print(f"Danmu Catcher MVP running at http://{args.host}:{args.port}")
     try:
@@ -791,6 +954,10 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        with STATE.lock:
+            worker_ids = list(STATE.capture_workers.keys())
+        for room_id in worker_ids:
+            stop_capture_worker(room_id)
         with STATE.lock:
             STATE.settings["running"] = False
         save_state()
